@@ -1,16 +1,19 @@
 import json
 from importlib import import_module
-from typing import Any, Iterator
+from typing import Any, Iterator, Tuple
 
 import pytest
 import respx
 from httpx import Response
 from opentelemetry import trace as trace_api
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.util.types import AttributeValue
 
 from openinference.instrumentation.portkey._request_attributes_extractor import (
     _RequestAttributesExtractor,
 )
+from openinference.instrumentation.portkey._utils import _finish_tracing
+from openinference.instrumentation.portkey._with_span import _WithSpan
 from openinference.semconv.trace import (
     AudioAttributes,
     ImageAttributes,
@@ -18,6 +21,7 @@ from openinference.semconv.trace import (
     MessageContentAttributes,
     OpenInferenceSpanKindValues,
     SpanAttributes,
+    ToolCallAttributes,
 )
 
 
@@ -314,6 +318,86 @@ def test_finish_reason_values(
     span = spans[0]
     attributes = dict(span.attributes or {})
     assert attributes.get(SpanAttributes.LLM_FINISH_REASON) == finish_reason
+
+
+def test_chat_completion_with_tool_calls(
+    in_memory_span_exporter: InMemorySpanExporter,
+    tracer_provider: trace_api.TracerProvider,
+    setup_portkey_instrumentation: None,
+) -> None:
+    in_memory_span_exporter.clear()
+    tool_calls = [
+        {
+            "id": f"call_{index}",
+            "type": "function",
+            "function": {"name": "get_weather", "arguments": json.dumps({"city": city})},
+        }
+        for index, city in enumerate(["Paris", "Rome"])
+    ]
+    with respx.mock(base_url="https://api.portkey.ai", assert_all_called=True) as respx_mock:
+        respx_mock.post("/v1/chat/completions").mock(
+            return_value=Response(
+                status_code=200,
+                json={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 1750000000,
+                    "model": "gpt-4o-mini-2024-07-18",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": tool_calls,
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                },
+            )
+        )
+        client = import_module("portkey_ai").Portkey(api_key="REDACTED", virtual_key="REDACTED")
+        client.chat.completions.create(
+            messages=[{"role": "user", "content": "Weather in Paris and Rome?"}],
+            model="gpt-4o-mini",
+        )
+
+    spans = in_memory_span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    attributes = dict(spans[0].attributes or {})
+    message = f"{SpanAttributes.LLM_OUTPUT_MESSAGES}.0"
+    assert attributes[f"{message}.{MessageAttributes.MESSAGE_ROLE}"] == "assistant"
+    for index, city in enumerate(["Paris", "Rome"]):
+        prefix = f"{message}.{MessageAttributes.MESSAGE_TOOL_CALLS}.{index}"
+        assert attributes[f"{prefix}.{ToolCallAttributes.TOOL_CALL_ID}"] == f"call_{index}"
+        assert attributes[f"{prefix}.{ToolCallAttributes.TOOL_CALL_FUNCTION_NAME}"] == "get_weather"
+        assert attributes[
+            f"{prefix}.{ToolCallAttributes.TOOL_CALL_FUNCTION_ARGUMENTS_JSON}"
+        ] == json.dumps({"city": city})
+
+
+def test_finish_tracing_when_attributes_fail(
+    in_memory_span_exporter: InMemorySpanExporter,
+    tracer_provider: trace_api.TracerProvider,
+) -> None:
+    def failing_attributes() -> Iterator[Tuple[str, AttributeValue]]:
+        yield SpanAttributes.OUTPUT_VALUE, "partial"
+        raise RuntimeError("attributes failed")
+
+    span = _WithSpan(tracer_provider.get_tracer(__name__).start_span("test"))
+    _finish_tracing(
+        with_span=span,
+        attributes=failing_attributes(),
+        extra_attributes=iter([(SpanAttributes.LLM_MODEL_NAME, "gpt-4o-mini")]),
+    )
+
+    # the span still ends, with the attributes that could be built
+    spans = in_memory_span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    attributes = dict(spans[0].attributes or {})
+    assert SpanAttributes.OUTPUT_VALUE not in attributes
+    assert attributes[SpanAttributes.LLM_MODEL_NAME] == "gpt-4o-mini"
 
 
 def test_uninstrument_restores_all_wrapped_methods(

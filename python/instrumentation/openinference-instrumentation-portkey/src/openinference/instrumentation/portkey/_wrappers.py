@@ -14,9 +14,13 @@ from openinference.instrumentation import get_attributes_from_context
 from openinference.instrumentation.portkey._request_attributes_extractor import (
     _RequestAttributesExtractor,
 )
+from openinference.instrumentation.portkey._response_accumulator import (
+    _ChatCompletionAccumulator,
+)
 from openinference.instrumentation.portkey._response_attributes_extractor import (
     _ResponseAttributesExtractor,
 )
+from openinference.instrumentation.portkey._stream import _Stream
 from openinference.instrumentation.portkey._utils import (
     _finish_tracing,
     _materialize_content_iterables,
@@ -31,6 +35,32 @@ _UNSET_SENTINEL_NAMES = frozenset({"NotGiven", "Omit"})
 
 def _is_set(value: Any) -> bool:
     return value is not None and type(value).__name__ not in _UNSET_SENTINEL_NAMES
+
+
+def _is_stream(response: Any) -> bool:
+    # With `stream=True`, `create` returns the `Stream` / `AsyncStream` of the openai SDK
+    # vendored by portkey, portkey's own `Stream` / `AsyncStream` for prompt completions, or
+    # a plain (async) generator in portkey-ai 1.x. Non-streamed responses are pydantic models.
+    return hasattr(response, "__next__") or hasattr(response, "__anext__")
+
+
+def _wrap_stream(
+    stream: Any,
+    span: _WithSpan,
+    request_parameters: Mapping[str, Any],
+    response_extractor: _ResponseAttributesExtractor,
+) -> _Stream:
+    return _Stream(
+        stream=stream,
+        with_span=span,
+        # A span that is not recording (e.g. sampled out) never reads the merged chunks.
+        response_accumulator=None
+        if span.is_finished
+        else _ChatCompletionAccumulator(
+            request_parameters=request_parameters,
+            response_attributes_extractor=response_extractor,
+        ),
+    )
 
 
 def _flatten(mapping: Mapping[str, Any]) -> Iterator[Tuple[str, AttributeValue]]:
@@ -158,6 +188,13 @@ class _CompletionsWrapper(_WithTracer):
                 span.finish_tracing(status=status)
                 raise
             try:
+                if _is_stream(response):
+                    return _wrap_stream(
+                        response,
+                        span,
+                        request_parameters,
+                        self._response_extractor,
+                    )
                 _finish_tracing(
                     with_span=span,
                     attributes=self._response_extractor.get_attributes(response),
@@ -225,6 +262,13 @@ class _AsyncCompletionsWrapper(_WithTracer):
                 span.finish_tracing(status=status)
                 raise
             try:
+                if _is_stream(response):
+                    return _wrap_stream(
+                        response,
+                        span,
+                        request_parameters,
+                        self._response_extractor,
+                    )
                 _finish_tracing(
                     with_span=span,
                     attributes=self._response_extractor.get_attributes(response),
